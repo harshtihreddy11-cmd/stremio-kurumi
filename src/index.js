@@ -1,14 +1,10 @@
 // ============================================================================
 //  Stremio addon for cdn.0000456.xyz  ("Kurumi Index")
-//  Runs on Deno Deploy
+//  Runs on Deno Deploy.
 //
-//  ENV VARS (set in Deno Deploy dashboard → Settings → Environment Variables):
-//    CF_CLEARANCE  – value of the cf_clearance cookie from your browser
-//    CF_UA         – the exact User-Agent string your browser sent
-//                    (Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) ...)
-//
-//  If those are not set, requests still go out (dl.0000456.xyz is often open),
-//  but the search/folder endpoints will likely 403 from Cloudflare.
+//  ENV VARS (Deno Deploy → Settings → Environment Variables):
+//    CF_CLEARANCE  – value of the cf_clearance cookie (from your browser)
+//    CF_UA         – exact User-Agent string (Firefox/Chrome, whatever set the cookie)
 // ============================================================================
 
 const CONFIG = {
@@ -16,7 +12,7 @@ const CONFIG = {
     indexBase: "https://cdn.0000456.xyz",
     providerPath: "/7",
     dlBase: "https://dl.0000456.xyz",
-    proxiedPlayback: false,        // set true only if dl.0000456.xyz 403s from Stremio
+    proxiedPlayback: false,
     maxFolderDepth: 2,
     maxSearchResults: 40,
     maxStreams: 40,
@@ -55,7 +51,7 @@ const ENDPOINTS = {
 };
 
 // ---------------------------------------------------------------------------
-// FILENAME PARSING (unchanged from your version)
+// FILENAME PARSING (unchanged)
 // ---------------------------------------------------------------------------
 const REGEX = {
     resolutions: {
@@ -148,7 +144,7 @@ function parseFilename(name) {
 }
 
 // ---------------------------------------------------------------------------
-// CLOUDFLARE-AWARE FETCH
+// CLOUDFLARE-AWARE FETCH (Fix 2 applied here)
 // ---------------------------------------------------------------------------
 function cfHeaders(extra = {}) {
     const cookie = Deno.env.get("CF_CLEARANCE") || "";
@@ -163,6 +159,18 @@ function cfHeaders(extra = {}) {
     };
     if (cookie) h["Cookie"] = `cf_clearance=${cookie}`;
     return h;
+}
+
+// Headers specifically for the /_server-islands/... endpoint
+function islandHeaders(referer) {
+    return cfHeaders({
+        "Referer": referer,
+        "Accept": "*/*",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Te": "trailers",
+    });
 }
 
 async function safeFetch(url, opts = {}) {
@@ -201,7 +209,7 @@ async function getMetadata(type, fullId) {
 }
 
 // ---------------------------------------------------------------------------
-// SCRAPING
+// SCRAPING (Fix 2, 3, 4 all applied here)
 // ---------------------------------------------------------------------------
 async function fetchSearchResults(query) {
     const url = new URL(CONFIG.indexBase + CONFIG.providerPath);
@@ -217,26 +225,10 @@ async function fetchSearchResults(query) {
     let entries = parseListingHtml(html);
     console.log(`[search] parsed ${entries.length} entries from HTML`);
 
-    // If the page is a skeleton (server islands pattern), fetch the island fragment
+    // Skeleton fallback: pull the _server-islands URL from the page and fetch it.
     if (entries.length === 0) {
-        const island = extractIslandUrl(html);
-        if (island) {
-            const absolute = new URL(island, CONFIG.indexBase).toString();
-            console.log(`[search] trying island ${absolute}`);
-            try {
-                const ri = await safeFetch(absolute, {
-                    headers: cfHeaders({ Referer: url.toString() }),
-                });
-                if (ri.ok) {
-                    const frag = await ri.text();
-                    console.log(`[search] island html length=${frag.length}`);
-                    entries = parseListingHtml(frag);
-                    console.log(`[search] parsed ${entries.length} entries from island`);
-                }
-            } catch (e) {
-                console.error(`[search] island fetch failed: ${e.message}`);
-            }
-        }
+        entries = await fetchIslandEntries(html, url.toString());
+        console.log(`[search] parsed ${entries.length} entries from island`);
     }
 
     return entries;
@@ -247,48 +239,80 @@ async function fetchFolderListing(folderId) {
     console.log(`[folder] GET ${url}`);
     const r = await safeFetch(url, { headers: cfHeaders() });
     if (!r.ok) throw new Error(`folder HTTP ${r.status}`);
-    let html = await r.text();
+    const html = await r.text();
     console.log(`[folder] html length=${html.length}`);
 
     let entries = parseListingHtml(html);
     console.log(`[folder] parsed ${entries.length} entries`);
 
     if (entries.length === 0) {
-        const island = extractIslandUrl(html);
-        if (island) {
-            const absolute = new URL(island, CONFIG.indexBase).toString();
-            try {
-                const ri = await safeFetch(absolute, {
-                    headers: cfHeaders({ Referer: url }),
-                });
-                if (ri.ok) {
-                    const frag = await ri.text();
-                    entries = parseListingHtml(frag);
-                    console.log(`[folder] parsed ${entries.length} entries from island`);
-                }
-            } catch (e) {
-                console.error(`[folder] island fetch failed: ${e.message}`);
-            }
-        }
+        entries = await fetchIslandEntries(html, url);
+        console.log(`[folder] parsed ${entries.length} entries from island`);
     }
 
     return entries;
 }
 
-// Extract the /_server-islands/StreamEntries?... URL the page wants to fetch
+async function fetchIslandEntries(html, referer) {
+    const islandHref = extractIslandUrl(html);
+    if (!islandHref) {
+        console.log("[island] no island URL found in page");
+        return [];
+    }
+    let abs;
+    try {
+        abs = new URL(islandHref, CONFIG.indexBase).toString();
+    } catch (e) {
+        console.error(`[island] bad URL "${islandHref}": ${e.message}`);
+        return [];
+    }
+    console.log(`[island] GET ${abs}`);
+    try {
+        const r = await safeFetch(abs, { headers: islandHeaders(referer) });
+        if (!r.ok) {
+            console.error(`[island] status=${r.status}`);
+            return [];
+        }
+        const frag = await r.text();
+        console.log(`[island] fragment length=${frag.length}`);
+        return parseListingHtml(frag);
+    } catch (e) {
+        console.error(`[island] fetch failed: ${e.message}`);
+        return [];
+    }
+}
+
+// Fix 3: full HTML-entity decoding (numeric hex/decimal + named)
+function decodeHtml(s) {
+    return String(s)
+        .replace(/&#x([0-9a-f]+);/gi, (_, h) => {
+            try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ""; }
+        })
+        .replace(/&#(\d+);/g, (_, d) => {
+            try { return String.fromCodePoint(parseInt(d, 10)); } catch { return ""; }
+        })
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&nbsp;/g, " ");
+}
+
 function extractIslandUrl(html) {
-    // Prefer the <link rel="preload" as="fetch" href="..."> form
+    // Prefer the preload link
     let m = html.match(/<link[^>]+as="fetch"[^>]+href="([^"]*_server-islands[^"]*)"/i);
     if (m) return decodeHtml(m[1]);
 
-    // Fallback: inside the script that calls replaceServerIsland
+    // Fallback: inside the inline script
     m = html.match(/fetch\(\s*"([^"]*_server-islands[^"]*)"/i);
     if (m) return decodeHtml(m[1]);
 
     return null;
 }
 
-// Robust: scan for every href="/7/{id}?t=f|d", pull name + size + created from nearby <td>s.
+// Robust listing parser (works for the full page and for the island fragment)
 function parseListingHtml(html) {
     const entries = [];
     const seen = new Set();
@@ -305,7 +329,6 @@ function parseListingHtml(html) {
         name = name.trim().replace(/\s+/g, " ");
         if (!name || name.length < 2) continue;
 
-        // Context window around this anchor to grab the size + created <td>s
         const ctxStart = Math.max(0, m.index - 300);
         const ctxEnd = Math.min(html.length, m.index + m[0].length + 1000);
         const context = html.slice(ctxStart, ctxEnd);
@@ -336,16 +359,6 @@ function parseListingHtml(html) {
 
 function stripTags(s) {
     return s.replace(/<[^>]+>/g, "");
-}
-
-function decodeHtml(s) {
-    return s
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, " ");
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +461,7 @@ function buildStream(entry, origin) {
 }
 
 // ---------------------------------------------------------------------------
-// MAIN HANDLER
+// MAIN HANDLER (Fix 4: try plain title AND dotted, on both page + island)
 // ---------------------------------------------------------------------------
 async function handleStream(type, fullId, origin) {
     console.log(`>>> handleStream type=${type} fullId=${fullId}`);
@@ -469,10 +482,9 @@ async function handleStream(type, fullId, origin) {
         }
     }
 
-    // Search WITHOUT the year — the site's UI uses plain-title queries.
-    const primary = meta.name;
+    const plain = meta.name;
     const dotted = meta.name.replace(/[^A-Za-z0-9]+/g, ".").replace(/^\.|\.$/g, "");
-    const queries = [primary, dotted].filter((q, i, a) => q && a.indexOf(q) === i);
+    const queries = [plain, dotted].filter((q, i, a) => q && a.indexOf(q) === i);
 
     let results = [];
     for (const q of queries) {
@@ -537,11 +549,11 @@ async function expandFolder(folderId, out, depth) {
 }
 
 // ---------------------------------------------------------------------------
-// PROXY PLAYBACK (only used if CONFIG.proxiedPlayback === true)
+// PROXY PLAYBACK (used only if CONFIG.proxiedPlayback === true)
 // ---------------------------------------------------------------------------
 async function proxyPlayback(fileId, filename, request) {
     const url = `${CONFIG.dlBase}/gd/${fileId}`;
-    const headers = cfHeaders({});
+    const headers = cfHeaders();
     const range = request.headers.get("Range");
     if (range) headers["Range"] = range;
 
@@ -575,6 +587,38 @@ export default {
 
         if (url.pathname === "/manifest.json") return jsonResponse(MANIFEST);
         if (url.pathname === "/") return Response.redirect(url.origin + "/manifest.json", 301);
+
+        // Temporary debug route — remove once everything works
+        if (url.pathname === "/debug") {
+            const q = url.searchParams.get("q") || "Hot Blood";
+            const target = new URL(CONFIG.indexBase + CONFIG.providerPath);
+            target.searchParams.set("q", q);
+            target.searchParams.set("page", "1");
+            const out = { query: q, url: target.toString(), env: {
+                CF_UA: !!Deno.env.get("CF_UA"),
+                CF_CLEARANCE: !!Deno.env.get("CF_CLEARANCE"),
+            }};
+            try {
+                const r1 = await fetch(target.toString(), { headers: cfHeaders() });
+                out.searchStatus = r1.status;
+                const html = await r1.text();
+                out.searchLen = html.length;
+                out.searchEntries = parseListingHtml(html).length;
+                const islandHref = extractIslandUrl(html);
+                out.islandHref = islandHref;
+                if (islandHref) {
+                    const abs = new URL(islandHref, CONFIG.indexBase).toString();
+                    out.islandUrl = abs;
+                    const r2 = await fetch(abs, { headers: islandHeaders(target.toString()) });
+                    out.islandStatus = r2.status;
+                    const frag = await r2.text();
+                    out.islandLen = frag.length;
+                    out.islandEntries = parseListingHtml(frag).length;
+                    out.islandPreview = frag.slice(0, 400);
+                }
+            } catch (e) { out.error = e.message; }
+            return jsonResponse(out);
+        }
 
         const playMatch = RE_PLAY.exec(url.pathname);
         if (playMatch) {
