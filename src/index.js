@@ -1,6 +1,14 @@
 // ============================================================================
-//  Stremio addon for cdn.0000456.xyz (Kurumi Index)
-//  Handles Astro "server-island" pages + regular pages
+//  Stremio addon for cdn.0000456.xyz  ("Kurumi Index")
+//  Runs on Deno Deploy
+//
+//  ENV VARS (set in Deno Deploy dashboard → Settings → Environment Variables):
+//    CF_CLEARANCE  – value of the cf_clearance cookie from your browser
+//    CF_UA         – the exact User-Agent string your browser sent
+//                    (Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) ...)
+//
+//  If those are not set, requests still go out (dl.0000456.xyz is often open),
+//  but the search/folder endpoints will likely 403 from Cloudflare.
 // ============================================================================
 
 const CONFIG = {
@@ -8,17 +16,17 @@ const CONFIG = {
     indexBase: "https://cdn.0000456.xyz",
     providerPath: "/7",
     dlBase: "https://dl.0000456.xyz",
-    proxiedPlayback: false,
+    proxiedPlayback: false,        // set true only if dl.0000456.xyz 403s from Stremio
     maxFolderDepth: 2,
-    maxSearchResults: 30,
-    maxStreams: 30,
+    maxSearchResults: 40,
+    maxStreams: 40,
+    maxCandidates: 400,
     resolutions: ["2160p", "1080p", "720p", "480p", "Unknown"],
     qualities: [
         "BluRay REMUX", "BluRay", "WEB-DL", "WEBRip", "HDRip",
         "HC HD-Rip", "DVDRip", "HDTV", "CAM", "TS", "TC", "SCR", "Unknown",
     ],
     visualTags: ["HDR10+", "HDR10", "HDR", "DV", "IMAX", "AI"],
-    audioTags: ["Atmos", "DD+", "DD", "DTS-HD MA", "DTS-HD", "DTS", "TrueHD", "AC3", "AAC"],
     sortBy: ["resolution", "visualTag", "size", "quality"],
     considerHdrTagsAsEqual: true,
 };
@@ -47,7 +55,7 @@ const ENDPOINTS = {
 };
 
 // ---------------------------------------------------------------------------
-// FILENAME PARSING
+// FILENAME PARSING (unchanged from your version)
 // ---------------------------------------------------------------------------
 const REGEX = {
     resolutions: {
@@ -139,18 +147,32 @@ function parseFilename(name) {
     return { resolution, quality, visualTags, audioTags, encode, languages };
 }
 
-function stripTags(s) {
-    return String(s).replace(/<[^>]+>/g, "");
+// ---------------------------------------------------------------------------
+// CLOUDFLARE-AWARE FETCH
+// ---------------------------------------------------------------------------
+function cfHeaders(extra = {}) {
+    const cookie = Deno.env.get("CF_CLEARANCE") || "";
+    const ua = Deno.env.get("CF_UA") ||
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0";
+    const h = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://cdn.0000456.xyz/",
+        ...extra,
+    };
+    if (cookie) h["Cookie"] = `cf_clearance=${cookie}`;
+    return h;
 }
 
-function decodeHtml(s) {
-    return String(s)
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, " ");
+async function safeFetch(url, opts = {}) {
+    const r = await fetch(url, opts);
+    if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        const snippet = body.slice(0, 300).replace(/\s+/g, " ");
+        console.error(`[fetch] ${url} status=${r.status} body=${snippet}`);
+    }
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,69 +180,140 @@ function decodeHtml(s) {
 // ---------------------------------------------------------------------------
 async function getMetadata(type, fullId) {
     const id = fullId.split(":")[0];
-    console.log(`[getMetadata] type=${type} id=${id}`);
-
     try {
         const r = await fetch(ENDPOINTS.CINEMETA.replace("{type}", type).replace("{id}", id));
         if (r.ok) {
             const d = await r.json();
-            if (d?.meta?.name) {
-                console.log(`[getMetadata] Cinemeta -> "${d.meta.name}" (${d.meta.year})`);
-                return { name: d.meta.name, year: d.meta.year };
-            }
+            if (d?.meta?.name) return { name: d.meta.name, year: d.meta.year };
         }
-        console.log(`[getMetadata] Cinemeta fail status=${r.status}`);
-    } catch (e) { console.error("Cinemeta error:", e.message); }
+    } catch (e) { console.error("Cinemeta failed", e); }
 
     try {
         const r = await fetch(ENDPOINTS.IMDB_SUGGEST.replace("{id}", id));
         if (r.ok) {
             const d = await r.json();
             const item = (d?.d || []).find(x => x.id === id);
-            if (item?.l) {
-                console.log(`[getMetadata] IMDb suggest -> "${item.l}" (${item.y})`);
-                return { name: item.l, year: item.y };
-            }
+            if (item?.l) return { name: item.l, year: item.y };
         }
-    } catch (e) { console.error("IMDb suggest error:", e.message); }
+    } catch (e) { console.error("IMDb suggest failed", e); }
 
-    console.log(`[getMetadata] no meta found`);
     return null;
 }
 
 // ---------------------------------------------------------------------------
-// HTML PARSING
+// SCRAPING
 // ---------------------------------------------------------------------------
+async function fetchSearchResults(query) {
+    const url = new URL(CONFIG.indexBase + CONFIG.providerPath);
+    url.searchParams.set("q", query);
+    url.searchParams.set("page", "1");
+    console.log(`[search] GET ${url}`);
 
-// Extract all entries from HTML that already has real <a href="/7/ID?t=f|d">.
-// Also tries the "no-anchor" fallback: a row with a heading-like name + size
-// + "New" badge (used by the site's server-island fragment).
+    const r = await safeFetch(url.toString(), { headers: cfHeaders() });
+    if (!r.ok) throw new Error(`search HTTP ${r.status}`);
+    const html = await r.text();
+    console.log(`[search] html length=${html.length}`);
+
+    let entries = parseListingHtml(html);
+    console.log(`[search] parsed ${entries.length} entries from HTML`);
+
+    // If the page is a skeleton (server islands pattern), fetch the island fragment
+    if (entries.length === 0) {
+        const island = extractIslandUrl(html);
+        if (island) {
+            const absolute = new URL(island, CONFIG.indexBase).toString();
+            console.log(`[search] trying island ${absolute}`);
+            try {
+                const ri = await safeFetch(absolute, {
+                    headers: cfHeaders({ Referer: url.toString() }),
+                });
+                if (ri.ok) {
+                    const frag = await ri.text();
+                    console.log(`[search] island html length=${frag.length}`);
+                    entries = parseListingHtml(frag);
+                    console.log(`[search] parsed ${entries.length} entries from island`);
+                }
+            } catch (e) {
+                console.error(`[search] island fetch failed: ${e.message}`);
+            }
+        }
+    }
+
+    return entries;
+}
+
+async function fetchFolderListing(folderId) {
+    const url = `${CONFIG.indexBase}${CONFIG.providerPath}/${folderId}?t=f`;
+    console.log(`[folder] GET ${url}`);
+    const r = await safeFetch(url, { headers: cfHeaders() });
+    if (!r.ok) throw new Error(`folder HTTP ${r.status}`);
+    let html = await r.text();
+    console.log(`[folder] html length=${html.length}`);
+
+    let entries = parseListingHtml(html);
+    console.log(`[folder] parsed ${entries.length} entries`);
+
+    if (entries.length === 0) {
+        const island = extractIslandUrl(html);
+        if (island) {
+            const absolute = new URL(island, CONFIG.indexBase).toString();
+            try {
+                const ri = await safeFetch(absolute, {
+                    headers: cfHeaders({ Referer: url }),
+                });
+                if (ri.ok) {
+                    const frag = await ri.text();
+                    entries = parseListingHtml(frag);
+                    console.log(`[folder] parsed ${entries.length} entries from island`);
+                }
+            } catch (e) {
+                console.error(`[folder] island fetch failed: ${e.message}`);
+            }
+        }
+    }
+
+    return entries;
+}
+
+// Extract the /_server-islands/StreamEntries?... URL the page wants to fetch
+function extractIslandUrl(html) {
+    // Prefer the <link rel="preload" as="fetch" href="..."> form
+    let m = html.match(/<link[^>]+as="fetch"[^>]+href="([^"]*_server-islands[^"]*)"/i);
+    if (m) return decodeHtml(m[1]);
+
+    // Fallback: inside the script that calls replaceServerIsland
+    m = html.match(/fetch\(\s*"([^"]*_server-islands[^"]*)"/i);
+    if (m) return decodeHtml(m[1]);
+
+    return null;
+}
+
+// Robust: scan for every href="/7/{id}?t=f|d", pull name + size + created from nearby <td>s.
 function parseListingHtml(html) {
     const entries = [];
     const seen = new Set();
-
-    // --- Pattern 1: standard <a href="/7/{id}?t=(f|d)">INNER</a> ---
     const anchorRe = /<a\b[^>]*href="\/7\/([A-Za-z0-9_-]+)\?t=([fd])"[^>]*>([\s\S]*?)<\/a>/g;
     let m;
     while ((m = anchorRe.exec(html)) !== null) {
         const [, id, kind, inner] = m;
         if (seen.has(id)) continue;
+        seen.add(id);
 
         let name = "";
         const spanMatch = inner.match(/<span[^>]*class="[^"]*truncate[^"]*"[^>]*>([\s\S]*?)<\/span>/);
-        if (spanMatch) name = stripTags(decodeHtml(spanMatch[1])).trim();
-        else name = stripTags(decodeHtml(inner)).trim();
+        name = spanMatch ? stripTags(decodeHtml(spanMatch[1])) : stripTags(decodeHtml(inner));
+        name = name.trim().replace(/\s+/g, " ");
         if (!name || name.length < 2) continue;
 
-        // Surrounding context to find size in a nearby <td>
-        const ctxStart = Math.max(0, m.index - 120);
-        const ctxEnd = Math.min(html.length, m.index + m[0].length + 600);
-        const ctx = html.slice(ctxStart, ctxEnd);
-        const tds = [...ctx.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/g)]
-            .map(t => stripTags(decodeHtml(t[1])).trim());
+        // Context window around this anchor to grab the size + created <td>s
+        const ctxStart = Math.max(0, m.index - 300);
+        const ctxEnd = Math.min(html.length, m.index + m[0].length + 1000);
+        const context = html.slice(ctxStart, ctxEnd);
+        const tds = [...context.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/g)]
+            .map(t => stripTags(decodeHtml(t[1])).trim())
+            .filter(Boolean);
 
-        let sizeBytes = 0;
-        let created = "";
+        let sizeBytes = 0, created = "";
         for (let i = 0; i < tds.length; i++) {
             const s = parseSize(tds[i]);
             if (s > 0 || tds[i] === "0 B") {
@@ -230,113 +323,29 @@ function parseListingHtml(html) {
             }
         }
 
-        seen.add(id);
-        entries.push({ id, name, type: kind === "f" ? "folder" : "file", sizeBytes, created });
+        entries.push({
+            id,
+            name,
+            type: kind === "f" ? "folder" : "file",
+            sizeBytes,
+            created,
+        });
     }
-
     return entries;
 }
 
-// Extract the server-island fetch tokens from the inline <script>.
-// The page has a call like:
-//   fetch("/_server-islands/StreamEntries?e=XXXX&p=YYYY&s=", { headers })
-// We pull e and p and rebuild the URL. If not present, returns null.
-function extractServerIslandTokens(html) {
-    // Match fetch("/_server-islands/StreamEntries?e=...&p=...&s=")
-    // Tokens are URL-encoded (contain %2F, %3D, etc.), so we allow those chars.
-    const re = /\/_server-islands\/StreamEntries\?e=([^&"']+)&p=([^&"']+)&s=([^"']*)/;
-    const m = html.match(re);
-    if (!m) return null;
-
-    // e and p may be percent-encoded; they need to stay encoded for the URL
-    // s is usually empty — leave as-is if missing
-    return { e: m[1], p: m[2], s: m[3] || "" };
+function stripTags(s) {
+    return s.replace(/<[^>]+>/g, "");
 }
 
-// Fetch the server-island fragment HTML for a page URL.
-// Returns the parsed entries, or null if the page has no server-island call.
-async function fetchServerIslandEntries(pageUrl, html) {
-    const tokens = extractServerIslandTokens(html);
-    if (!tokens) {
-        console.log(`[island] no server-island tokens found in ${pageUrl}`);
-        return null;
-    }
-    console.log(`[island] tokens found: e=${tokens.e.slice(0, 16)}... p=${tokens.p.slice(0, 16)}...`);
-
-    // Build island URL
-    const islandUrl = `${CONFIG.indexBase}/_server-islands/StreamEntries?e=${tokens.e}&p=${tokens.p}&s=${tokens.s}`;
-    console.log(`[island] GET ${islandUrl.slice(0, 120)}...`);
-
-    const r = await fetch(islandUrl, {
-        headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": pageUrl,
-        },
-    });
-    console.log(`[island] status=${r.status} ok=${r.ok}`);
-    if (!r.ok) {
-        const err = await r.text();
-        console.log(`[island] error body: ${err.slice(0, 200)}`);
-        return null;
-    }
-    const body = await r.text();
-    console.log(`[island] html length=${body.length}`);
-    const entries = parseListingHtml(body);
-    console.log(`[island] parsed ${entries.length} entries`);
-    return entries;
-}
-
-// Full-page fetch that:
-//   1. Fetches the page HTML
-//   2. Parses entries from the page HTML directly (if any)
-//   3. Also extracts server-island tokens and fetches the fragment
-//   4. Merges results, dedupes by id
-async function fetchPage(pageUrl) {
-    console.log(`[fetchPage] GET ${pageUrl}`);
-    const r = await fetch(pageUrl, {
-        headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    });
-    console.log(`[fetchPage] status=${r.status} ok=${r.ok}`);
-    if (!r.ok) throw new Error(`page HTTP ${r.status} for ${pageUrl}`);
-    const html = await r.text();
-    console.log(`[fetchPage] html length=${html.length}`);
-
-    const fromPage = parseListingHtml(html);
-    console.log(`[fetchPage] parsed ${fromPage.length} entries from page HTML directly`);
-
-    let fromIsland = null;
-    try {
-        fromIsland = await fetchServerIslandEntries(pageUrl, html);
-    } catch (e) {
-        console.error(`[island] error: ${e.message}`);
-    }
-
-    const merged = [...fromPage];
-    const seen = new Set(merged.map(e => e.id));
-    if (fromIsland) {
-        for (const e of fromIsland) {
-            if (!seen.has(e.id)) { merged.push(e); seen.add(e.id); }
-        }
-    }
-    console.log(`[fetchPage] total merged entries: ${merged.length}`);
-    return merged;
-}
-
-async function fetchSearchResults(query) {
-    const url = new URL(CONFIG.indexBase + CONFIG.providerPath);
-    url.searchParams.set("q", query);
-    url.searchParams.set("page", "1");
-    return fetchPage(url.toString());
-}
-
-async function fetchFolderListing(folderId) {
-    return fetchPage(CONFIG.indexBase + CONFIG.providerPath + "/" + folderId);
+function decodeHtml(s) {
+    return s
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, " ");
 }
 
 // ---------------------------------------------------------------------------
@@ -346,25 +355,13 @@ function normaliseTitle(s) {
     return String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
-// Very forgiving: if the title has 2+ words, accept if the LONGEST word (4+ chars)
-// appears in the filename. This handles transliterations, articles, etc.
 function titleMatches(filename, title, year) {
     const f = normaliseTitle(filename);
-    if (!f) return false;
-
-    const tNorm = normaliseTitle(title);
-    if (tNorm && f.includes(tNorm)) {
-        if (!year || f.includes(String(year))) return true;
-    }
-
-    const words = tNorm.split(" ").filter(w => w.length >= 3);
-    if (words.length > 0) {
-        const longest = words.reduce((a, b) => (b.length > a.length ? b : a), "");
-        if (longest.length >= 4 && f.includes(longest)) {
-            if (!year || f.includes(String(year))) return true;
-        }
-    }
-    return false;
+    const tokens = normaliseTitle(title).split(" ").filter(Boolean);
+    if (!tokens.length) return false;
+    if (!tokens.every(t => f.includes(t))) return false;
+    if (year && !f.includes(String(year))) return false;
+    return true;
 }
 
 function episodeMatches(filename, season, episode) {
@@ -378,6 +375,7 @@ function episodeMatches(filename, season, episode) {
         `${s}x${ep}`, `${s}x${e}`,
         `season ${s} episode ${e}`, `season ${sp} episode ${ep}`,
         `s${sp}ep${ep}`, `s${s}ep${e}`,
+        `ep${ep}`, `ep ${ep}`, `episode ${e}`,
     ];
     const f = filename.toLowerCase().replace(/[^a-z0-9 ]/g, " ");
     return candidates.some(c => f.includes(c.toLowerCase()));
@@ -441,7 +439,7 @@ function buildStream(entry, origin) {
         behaviorHints: {
             videoSize: entry.sizeBytes || 0,
             filename: entry.name,
-            bingeGroup: `${CONFIG.addonName}|${parsed.resolution}|${parsed.quality}`,
+            bingeGroup: `${CONFIG.addonName}|${parsed.resolution}|${parsed.quality}|${parsed.visualTags.join(",")}`,
         },
         ...parsed,
         sizeBytes: entry.sizeBytes,
@@ -457,9 +455,10 @@ async function handleStream(type, fullId, origin) {
 
     const meta = await getMetadata(type, fullId);
     if (!meta) {
-        console.log("!!! no meta, abort");
+        console.log("!!! no meta");
         return { streams: [] };
     }
+    console.log(`META name="${meta.name}" year="${meta.year}"`);
 
     let season, episode;
     if (type === "series") {
@@ -470,43 +469,51 @@ async function handleStream(type, fullId, origin) {
         }
     }
 
-    const searchQuery = type === "movie"
-        ? `${meta.name} ${meta.year}`
-        : `${meta.name}`;
-    console.log(`[search] query="${searchQuery}"`);
+    // Search WITHOUT the year — the site's UI uses plain-title queries.
+    const primary = meta.name;
+    const dotted = meta.name.replace(/[^A-Za-z0-9]+/g, ".").replace(/^\.|\.$/g, "");
+    const queries = [primary, dotted].filter((q, i, a) => q && a.indexOf(q) === i);
 
-    let results;
-    try {
-        results = await fetchSearchResults(searchQuery);
-    } catch (e) {
-        console.error(`[search] failed: ${e.message}`);
-        return { streams: [] };
+    let results = [];
+    for (const q of queries) {
+        console.log(`SEARCH QUERY "${q}"`);
+        try {
+            results = await fetchSearchResults(q);
+        } catch (e) {
+            console.error(`search failed for "${q}": ${e.message}`);
+            results = [];
+        }
+        if (results.length > 0) break;
     }
 
     results = results.slice(0, CONFIG.maxSearchResults);
-    console.log(`[search] using ${results.length} results`);
+    console.log(`RESULTS ${results.length}`);
     results.slice(0, 10).forEach(r => console.log(`  [${r.type}] ${r.name} (${r.sizeBytes}B)`));
 
     const candidates = [];
     for (const entry of results) {
         if (entry.type === "folder") {
-            try { await expandFolder(entry.id, candidates, 0); }
-            catch (e) { console.error(`[folder] ${entry.id}: ${e.message}`); }
+            await expandFolder(entry.id, candidates, 0);
         } else {
             candidates.push(entry);
         }
-        if (candidates.length > 200) break;
+        if (candidates.length >= CONFIG.maxCandidates) break;
     }
-    console.log(`[search] candidates after folders: ${candidates.length}`);
+    console.log(`CANDIDATES after folders: ${candidates.length}`);
 
-    const filtered = candidates.filter(entry => {
-        if (!titleMatches(entry.name, meta.name, type === "movie" ? meta.year : null)) return false;
-        if (type === "series" && season && episode) {
-            if (!episodeMatches(entry.name, season, episode)) return false;
+    const filtered = [];
+    for (const entry of candidates) {
+        const tMatch = titleMatches(entry.name, meta.name, type === "movie" ? meta.year : null);
+        const eMatch = type === "series" && season && episode
+            ? episodeMatches(entry.name, season, episode)
+            : true;
+        if (!tMatch || !eMatch) {
+            if (candidates.length <= 30) console.log(`reject: ${entry.name} {title:${tMatch}, ep:${eMatch}}`);
+            continue;
         }
-        return true;
-    });
-    console.log(`[search] filtered: ${filtered.length}`);
+        filtered.push(entry);
+    }
+    console.log(`FILTERED ${filtered.length}`);
 
     const streams = filtered.map(e => buildStream(e, origin));
     sortStreams(streams);
@@ -515,25 +522,35 @@ async function handleStream(type, fullId, origin) {
 
 async function expandFolder(folderId, out, depth) {
     if (depth >= CONFIG.maxFolderDepth) return;
-    const entries = await fetchFolderListing(folderId);
+    let entries;
+    try {
+        entries = await fetchFolderListing(folderId);
+    } catch (e) {
+        console.error("folder failed:", e.message);
+        return;
+    }
     for (const entry of entries) {
         if (entry.type === "folder") await expandFolder(entry.id, out, depth + 1);
         else out.push(entry);
-        if (out.length > 300) break;
+        if (out.length >= CONFIG.maxCandidates) break;
     }
 }
 
 // ---------------------------------------------------------------------------
-// PROXY PLAYBACK
+// PROXY PLAYBACK (only used if CONFIG.proxiedPlayback === true)
 // ---------------------------------------------------------------------------
 async function proxyPlayback(fileId, filename, request) {
     const url = `${CONFIG.dlBase}/gd/${fileId}`;
-    const headers = {};
+    const headers = cfHeaders({});
     const range = request.headers.get("Range");
-    if (range) headers.Range = range;
+    if (range) headers["Range"] = range;
 
     const r = await fetch(url, { headers, redirect: "follow" });
-    if (!r.ok) return new Response("Upstream error", { status: r.status });
+    if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        console.error(`[play] ${url} status=${r.status} body=${body.slice(0, 200)}`);
+        return new Response("Upstream error", { status: r.status });
+    }
 
     const out = new Headers();
     for (const h of ["content-type", "content-length", "content-range", "accept-ranges"]) {
